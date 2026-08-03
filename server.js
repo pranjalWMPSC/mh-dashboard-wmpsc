@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const session = require('express-session');
+const MongoStore = require('connect-mongo');
 const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcryptjs');
 const path = require('path');
@@ -11,9 +12,12 @@ const { MongoClient } = require('mongodb');
 const REQUIRED_ENV = ['MONGO_URI', 'DB_NAME', 'COLLECTION_NAME', 'ADMIN_USERNAME', 'ADMIN_PASSWORD_HASH', 'SESSION_SECRET'];
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
 if (missing.length) {
-  console.error(`Missing required .env values: ${missing.join(', ')}`);
-  console.error('Copy .env.example to .env and fill it in (see README.md).');
-  process.exit(1);
+  // Throwing (rather than process.exit) so this surfaces clearly in both
+  // `node server.js` locally AND in Vercel's serverless function logs.
+  throw new Error(
+    `Missing required environment variables: ${missing.join(', ')}. ` +
+    'Copy .env.example to .env locally, or set these in your Vercel project settings.'
+  );
 }
 
 const PORT = process.env.PORT || 3000;
@@ -83,17 +87,27 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(express.json());
+// Serves public/index.html etc. for local dev (`npm start` -> localhost:3000).
+// On Vercel this middleware is simply never reached for those paths — Vercel
+// serves anything in public/** directly via its CDN before requests hit this
+// function at all, so nothing needs to change here for deployment.
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.use(session({
   name: 'wmpsc.sid',
   secret: process.env.SESSION_SECRET,
+  store: MongoStore.create({
+    mongoUrl: process.env.MONGO_URI,
+    dbName: process.env.DB_NAME,
+    collectionName: 'sessions',
+    ttl: 8 * 60 * 60, // seconds
+  }),
   resave: false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production', // set NODE_ENV=production once you run behind HTTPS
+    secure: process.env.NODE_ENV === 'production', // Vercel sets NODE_ENV=production automatically
     maxAge: 8 * 60 * 60 * 1000, // 8 hours
   },
 }));
@@ -111,15 +125,30 @@ function requireLogin(req, res, next) {
   return res.status(401).json({ error: 'Not logged in' });
 }
 
-// ---- Mongo connection (one client, reused) ----
-let collection;
-async function initMongo() {
-  const client = new MongoClient(process.env.MONGO_URI);
-  await client.connect();
-  const db = client.db(process.env.DB_NAME);
-  collection = db.collection(process.env.COLLECTION_NAME);
-  console.log(`Connected to MongoDB: ${process.env.DB_NAME}.${process.env.COLLECTION_NAME}`);
+// ---- Mongo connection ----
+// Cached across invocations: on Vercel, warm serverless instances reuse this
+// module's memory, so we connect once and reuse the same client rather than
+// reconnecting on every request (works the same way for local `npm start`).
+let clientPromise = null;
+function getCollection() {
+  if (!clientPromise) {
+    const client = new MongoClient(process.env.MONGO_URI);
+    clientPromise = client.connect().then(() => {
+      console.log(`Connected to MongoDB: ${process.env.DB_NAME}.${process.env.COLLECTION_NAME}`);
+      return client;
+    });
+  }
+  return clientPromise.then((client) => client.db(process.env.DB_NAME).collection(process.env.COLLECTION_NAME));
 }
+
+// Makes req.collection available to every route below without each one
+// needing to know about connection caching.
+app.use(async (req, res, next) => {
+  try {
+    req.collection = await getCollection();
+    next();
+  } catch (err) { next(err); }
+});
 
 // ---- Auth routes ----
 app.get('/api/session', (req, res) => {
@@ -149,7 +178,7 @@ app.post('/api/logout', (req, res) => {
 app.get('/api/today', requireLogin, async (req, res, next) => {
   try {
     const { start, end } = getTodayRangeUTC(TIMEZONE);
-    const docs = await collection
+    const docs = await req.collection
       .find({ submittedAt: { $gte: start, $lt: end } }, { projection })
       .sort({ submittedAt: -1 })
       .toArray();
@@ -162,24 +191,24 @@ app.get('/api/stats', requireLogin, async (req, res, next) => {
     const { start, end } = getTodayRangeUTC(TIMEZONE);
 
     const [totalUniqueAgg, todayUniqueAgg, byPartnerAgg, byJobRoleAgg, totalRows, todayRows] = await Promise.all([
-      collection.aggregate([{ $group: { _id: `$${FIELD_MAP.aadhar}` } }, { $count: 'count' }]).toArray(),
-      collection.aggregate([
+      req.collection.aggregate([{ $group: { _id: `$${FIELD_MAP.aadhar}` } }, { $count: 'count' }]).toArray(),
+      req.collection.aggregate([
         { $match: { submittedAt: { $gte: start, $lt: end } } },
         { $group: { _id: `$${FIELD_MAP.aadhar}` } },
         { $count: 'count' },
       ]).toArray(),
-      collection.aggregate([
+      req.collection.aggregate([
         { $group: { _id: { partner: `$${FIELD_MAP.trainingPartner}`, aadhar: `$${FIELD_MAP.aadhar}` } } },
         { $group: { _id: '$_id.partner', count: { $sum: 1 } } },
         { $sort: { count: -1 } },
       ]).toArray(),
-      collection.aggregate([
+      req.collection.aggregate([
         { $group: { _id: { jobRole: `$${FIELD_MAP.jobRole}`, aadhar: `$${FIELD_MAP.aadhar}` } } },
         { $group: { _id: '$_id.jobRole', count: { $sum: 1 } } },
         { $sort: { count: -1 } },
       ]).toArray(),
-      collection.countDocuments({}),
-      collection.countDocuments({ submittedAt: { $gte: start, $lt: end } }),
+      req.collection.countDocuments({}),
+      req.collection.countDocuments({ submittedAt: { $gte: start, $lt: end } }),
     ]);
 
     res.json({
@@ -208,7 +237,7 @@ async function buildWorkbook(docs, sheetTitle) {
 app.get('/download/today', requireLogin, async (req, res, next) => {
   try {
     const { start, end } = getTodayRangeUTC(TIMEZONE);
-    const docs = await collection.find({ submittedAt: { $gte: start, $lt: end } }, { projection }).toArray();
+    const docs = await req.collection.find({ submittedAt: { $gte: start, $lt: end } }, { projection }).toArray();
     const workbook = await buildWorkbook(docs, "Today's Candidates");
     const dateStr = new Date().toISOString().slice(0, 10);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -221,7 +250,7 @@ app.get('/download/today', requireLogin, async (req, res, next) => {
 app.get('/download/all', requireLogin, async (req, res, next) => {
   try {
     // Dedupe by Aadhar: keep only the most recent submission per candidate.
-    const docs = await collection.aggregate([
+    const docs = await req.collection.aggregate([
       { $sort: { submittedAt: -1 } },
       { $group: { _id: `$${FIELD_MAP.aadhar}`, doc: { $first: '$$ROOT' } } },
       { $replaceRoot: { newRoot: '$doc' } },
@@ -241,11 +270,11 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Server error' });
 });
 
-initMongo()
-  .then(() => {
-    app.listen(PORT, () => console.log(`Dashboard running at http://localhost:${PORT}`));
-  })
-  .catch((err) => {
-    console.error('Failed to connect to MongoDB:', err.message);
-    process.exit(1);
-  });
+// Vercel imports this file and calls the exported app directly as a
+// serverless function — it does NOT run app.listen(). Locally, running
+// `node server.js` / `npm start` still starts a normal server on PORT.
+module.exports = app;
+
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`Dashboard running at http://localhost:${PORT}`));
+}
