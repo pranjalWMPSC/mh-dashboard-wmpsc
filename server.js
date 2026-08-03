@@ -1,0 +1,251 @@
+require('dotenv').config();
+
+const express = require('express');
+const session = require('express-session');
+const rateLimit = require('express-rate-limit');
+const bcrypt = require('bcryptjs');
+const path = require('path');
+const ExcelJS = require('exceljs');
+const { MongoClient } = require('mongodb');
+
+const REQUIRED_ENV = ['MONGO_URI', 'DB_NAME', 'COLLECTION_NAME', 'ADMIN_USERNAME', 'ADMIN_PASSWORD_HASH', 'SESSION_SECRET'];
+const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
+if (missing.length) {
+  console.error(`Missing required .env values: ${missing.join(', ')}`);
+  console.error('Copy .env.example to .env and fill it in (see README.md).');
+  process.exit(1);
+}
+
+const PORT = process.env.PORT || 3000;
+const TIMEZONE = process.env.TIMEZONE || 'Asia/Kolkata';
+
+// The exact fields the dashboard/table/exports are allowed to show.
+// This is the ONLY place field names are mapped, so it's easy to adjust
+// if a client's Mongo documents use slightly different field names.
+const FIELD_MAP = {
+  aadhar: 'aadhar',
+  name: 'name',
+  mobile: 'mobile',
+  jobRole: 'jobRole',
+  trainingPartner: 'trainingPartner',
+  district: 'district', // falls back to '' if not present on the document
+  taluka: 'taluka',
+  gramPanchayat: 'gramPanchayat',
+};
+const COLUMN_ORDER = ['aadhar', 'name', 'mobile', 'jobRole', 'trainingPartner', 'district', 'taluka', 'gramPanchayat'];
+const COLUMN_LABELS = {
+  aadhar: 'Aadhar',
+  name: 'Name',
+  mobile: 'Mobile',
+  jobRole: 'Job Role',
+  trainingPartner: 'Training Partner',
+  district: 'District',
+  taluka: 'Taluka',
+  gramPanchayat: 'Gram Panchayat',
+};
+
+const projection = COLUMN_ORDER.reduce((acc, key) => {
+  acc[FIELD_MAP[key]] = 1;
+  return acc;
+}, { _id: 0, submittedAt: 1 });
+
+function shapeDoc(doc) {
+  const out = {};
+  for (const key of COLUMN_ORDER) {
+    out[key] = doc[FIELD_MAP[key]] ?? '';
+  }
+  return out;
+}
+
+// ---- Timezone-safe "today" boundaries (no extra date library needed) ----
+function getTodayRangeUTC(timeZone) {
+  const now = new Date();
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const parts = dtf.formatToParts(now).reduce((acc, p) => {
+    acc[p.type] = p.value;
+    return acc;
+  }, {});
+  const asIfUTC = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
+  const offsetMinutes = Math.round((asIfUTC - now.getTime()) / 60000); // timezone minus UTC
+  const localMidnightAsIfUTC = Date.UTC(parts.year, parts.month - 1, parts.day, 0, 0, 0);
+  const startUTC = new Date(localMidnightAsIfUTC - offsetMinutes * 60000);
+  const endUTC = new Date(startUTC.getTime() + 24 * 60 * 60 * 1000);
+  return { start: startUTC, end: endUTC };
+}
+
+// ---- App setup ----
+const app = express();
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.use(session({
+  name: 'wmpsc.sid',
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production', // set NODE_ENV=production once you run behind HTTPS
+    maxAge: 8 * 60 * 60 * 1000, // 8 hours
+  },
+}));
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Try again in a few minutes.' },
+});
+
+function requireLogin(req, res, next) {
+  if (req.session && req.session.loggedIn) return next();
+  return res.status(401).json({ error: 'Not logged in' });
+}
+
+// ---- Mongo connection (one client, reused) ----
+let collection;
+async function initMongo() {
+  const client = new MongoClient(process.env.MONGO_URI);
+  await client.connect();
+  const db = client.db(process.env.DB_NAME);
+  collection = db.collection(process.env.COLLECTION_NAME);
+  console.log(`Connected to MongoDB: ${process.env.DB_NAME}.${process.env.COLLECTION_NAME}`);
+}
+
+// ---- Auth routes ----
+app.get('/api/session', (req, res) => {
+  res.json({ loggedIn: !!(req.session && req.session.loggedIn) });
+});
+
+app.post('/api/login', loginLimiter, async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+
+  const validUser = username === process.env.ADMIN_USERNAME;
+  const validPass = validUser && (await bcrypt.compare(password, process.env.ADMIN_PASSWORD_HASH));
+
+  if (!validUser || !validPass) {
+    return res.status(401).json({ error: 'Invalid username or password' });
+  }
+  req.session.loggedIn = true;
+  req.session.username = username;
+  res.json({ ok: true });
+});
+
+app.post('/api/logout', (req, res) => {
+  req.session.destroy(() => res.json({ ok: true }));
+});
+
+// ---- Data routes ----
+app.get('/api/today', requireLogin, async (req, res, next) => {
+  try {
+    const { start, end } = getTodayRangeUTC(TIMEZONE);
+    const docs = await collection
+      .find({ submittedAt: { $gte: start, $lt: end } }, { projection })
+      .sort({ submittedAt: -1 })
+      .toArray();
+    res.json(docs.map(shapeDoc));
+  } catch (err) { next(err); }
+});
+
+app.get('/api/stats', requireLogin, async (req, res, next) => {
+  try {
+    const { start, end } = getTodayRangeUTC(TIMEZONE);
+
+    const [totalUniqueAgg, todayUniqueAgg, byPartnerAgg, byJobRoleAgg, totalRows, todayRows] = await Promise.all([
+      collection.aggregate([{ $group: { _id: `$${FIELD_MAP.aadhar}` } }, { $count: 'count' }]).toArray(),
+      collection.aggregate([
+        { $match: { submittedAt: { $gte: start, $lt: end } } },
+        { $group: { _id: `$${FIELD_MAP.aadhar}` } },
+        { $count: 'count' },
+      ]).toArray(),
+      collection.aggregate([
+        { $group: { _id: { partner: `$${FIELD_MAP.trainingPartner}`, aadhar: `$${FIELD_MAP.aadhar}` } } },
+        { $group: { _id: '$_id.partner', count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+      ]).toArray(),
+      collection.aggregate([
+        { $group: { _id: { jobRole: `$${FIELD_MAP.jobRole}`, aadhar: `$${FIELD_MAP.aadhar}` } } },
+        { $group: { _id: '$_id.jobRole', count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+      ]).toArray(),
+      collection.countDocuments({}),
+      collection.countDocuments({ submittedAt: { $gte: start, $lt: end } }),
+    ]);
+
+    res.json({
+      totalUniqueCandidates: totalUniqueAgg[0]?.count || 0,
+      todayUniqueCandidates: todayUniqueAgg[0]?.count || 0,
+      totalRows,
+      todayRows,
+      byTrainingPartner: byPartnerAgg.map((r) => ({ label: r._id || 'Unknown', count: r.count })),
+      byJobRole: byJobRoleAgg.map((r) => ({ label: r._id || 'Unknown', count: r.count })),
+    });
+  } catch (err) { next(err); }
+});
+
+// ---- Excel export ----
+async function buildWorkbook(docs, sheetTitle) {
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet(sheetTitle);
+  sheet.columns = COLUMN_ORDER.map((key) => ({ header: COLUMN_LABELS[key], key, width: key === 'name' ? 24 : 18 }));
+  sheet.getRow(1).font = { bold: true };
+  sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
+  docs.forEach((d) => sheet.addRow(shapeDoc(d)));
+  sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: COLUMN_ORDER.length } };
+  return workbook;
+}
+
+app.get('/download/today', requireLogin, async (req, res, next) => {
+  try {
+    const { start, end } = getTodayRangeUTC(TIMEZONE);
+    const docs = await collection.find({ submittedAt: { $gte: start, $lt: end } }, { projection }).toArray();
+    const workbook = await buildWorkbook(docs, "Today's Candidates");
+    const dateStr = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="candidates-today-${dateStr}.xlsx"`);
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err) { next(err); }
+});
+
+app.get('/download/all', requireLogin, async (req, res, next) => {
+  try {
+    // Dedupe by Aadhar: keep only the most recent submission per candidate.
+    const docs = await collection.aggregate([
+      { $sort: { submittedAt: -1 } },
+      { $group: { _id: `$${FIELD_MAP.aadhar}`, doc: { $first: '$$ROOT' } } },
+      { $replaceRoot: { newRoot: '$doc' } },
+      { $project: projection },
+    ]).toArray();
+    const workbook = await buildWorkbook(docs, 'All Candidates (Unique Aadhar)');
+    const dateStr = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="candidates-all-${dateStr}.xlsx"`);
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err) { next(err); }
+});
+
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Server error' });
+});
+
+initMongo()
+  .then(() => {
+    app.listen(PORT, () => console.log(`Dashboard running at http://localhost:${PORT}`));
+  })
+  .catch((err) => {
+    console.error('Failed to connect to MongoDB:', err.message);
+    process.exit(1);
+  });

@@ -1,0 +1,19 @@
+{
+  "name": "wmpsc-candidate-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Simple login-protected dashboard for today's / total candidate data from MongoDB, with Excel export.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "express-session": "^1.18.0",
+    "mongodb": "^6.9.0"
+  }
+}

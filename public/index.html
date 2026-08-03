@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>WMPSC Candidate Dashboard</title>
+<style>
+  :root {
+    --blue: #2563eb;
+    --blue-dark: #1d4ed8;
+    --bg: #f4f6fb;
+    --card: #ffffff;
+    --border: #e2e8f0;
+    --text: #1e293b;
+    --muted: #64748b;
+    --green: #16a34a;
+    --red: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+
+  /* ---------- Login screen ---------- */
+  #loginScreen {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .login-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 36px 32px;
+    width: 100%;
+    max-width: 360px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.06);
+  }
+  .login-card h1 {
+    font-size: 20px;
+    margin: 0 0 4px;
+  }
+  .login-card p.subtitle {
+    color: var(--muted);
+    margin: 0 0 24px;
+    font-size: 14px;
+  }
+  label {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 6px;
+    color: var(--muted);
+  }
+  input[type="text"], input[type="password"] {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 14px;
+    margin-bottom: 16px;
+  }
+  input:focus { outline: 2px solid var(--blue); outline-offset: 1px; }
+  button {
+    cursor: pointer;
+    border: none;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 14px;
+  }
+  .btn-primary {
+    background: var(--blue);
+    color: white;
+    padding: 10px 16px;
+    width: 100%;
+  }
+  .btn-primary:hover { background: var(--blue-dark); }
+  .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+  #loginError {
+    color: var(--red);
+    font-size: 13px;
+    margin-bottom: 12px;
+    min-height: 18px;
+  }
+
+  /* ---------- Dashboard ---------- */
+  #dashboard { display: none; }
+  header {
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    position: sticky;
+    top: 0;
+    z-index: 5;
+  }
+  header h1 { font-size: 17px; margin: 0; }
+  header .right { display: flex; align-items: center; gap: 14px; }
+  #logoutBtn {
+    background: transparent;
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    border-radius: 8px;
+    color: var(--muted);
+  }
+  #logoutBtn:hover { background: #f1f5f9; }
+
+  main { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+  .stat-card .label { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .stat-card .value { font-size: 28px; font-weight: 700; }
+  .stat-card .sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  .breakdown-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--text); }
+  .bar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 13px; }
+  .bar-row .name { flex: 0 0 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  .bar-track { flex: 1; background: #eef2f7; border-radius: 6px; height: 10px; overflow: hidden; }
+  .bar-fill { background: var(--blue); height: 100%; }
+  .bar-count { flex: 0 0 30px; text-align: right; font-weight: 600; }
+
+  .table-section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+  }
+  .table-section .table-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .table-header h2 { font-size: 15px; margin: 0; }
+  .download-buttons { display: flex; gap: 10px; }
+  .btn-secondary {
+    background: var(--card);
+    border: 1px solid var(--blue);
+    color: var(--blue);
+    padding: 8px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+  }
+  .btn-secondary:hover { background: #eff6ff; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th {
+    text-align: left;
+    padding: 10px 8px;
+    border-bottom: 2px solid var(--border);
+    color: var(--muted);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 9px 8px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  tbody tr:hover { background: #f8fafc; }
+  .empty-state { text-align: center; padding: 30px; color: var(--muted); font-size: 14px; }
+  .table-wrap { overflow-x: auto; }
+  #loadingDash { text-align: center; padding: 40px; color: var(--muted); }
+
+  .pagination {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+  }
+  .pagination-info { font-size: 13px; color: var(--muted); }
+  .pagination-controls { display: flex; align-items: center; gap: 8px; }
+  .pagination-controls select {
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+  }
+  .pagination-controls button {
+    padding: 6px 12px;
+    font-size: 13px;
+  }
+  .pagination-controls button:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>
+</head>
+<body>
+
+<!-- ================= LOGIN SCREEN ================= -->
+<div id="loginScreen">
+  <div class="login-card">
+    <h1>WMPSC Candidate Dashboard</h1>
+    <p class="subtitle">Sign in to view candidate data</p>
+    <div id="loginError"></div>
+    <form id="loginForm">
+      <label for="username">Username</label>
+      <input type="text" id="username" autocomplete="username" required />
+      <label for="password">Password</label>
+      <input type="password" id="password" autocomplete="current-password" required />
+      <button type="submit" class="btn-primary" id="loginBtn">Sign In</button>
+    </form>
+  </div>
+</div>
+
+<!-- ================= DASHBOARD ================= -->
+<div id="dashboard">
+  <header>
+    <h1>WMPSC Candidate Dashboard</h1>
+    <div class="right">
+      <span id="whoami" style="font-size:13px;color:var(--muted);"></span>
+      <button id="logoutBtn">Log out</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="loadingDash">Loading data…</div>
+
+    <div id="dashContent" style="display:none;">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="label">Total Unique Candidates (all time)</div>
+          <div class="value" id="statTotalUnique">–</div>
+          <div class="sub" id="statTotalRows"></div>
+        </div>
+        <div class="stat-card">
+          <div class="label">Today's Unique Candidates</div>
+          <div class="value" id="statTodayUnique">–</div>
+          <div class="sub" id="statTodayRows"></div>
+        </div>
+        <div class="stat-card">
+          <div class="label">Training Partners (active)</div>
+          <div class="value" id="statPartnerCount">–</div>
+        </div>
+        <div class="stat-card">
+          <div class="label">Job Roles Covered</div>
+          <div class="value" id="statJobRoleCount">–</div>
+        </div>
+      </div>
+
+      <div class="breakdown-grid">
+        <div class="panel">
+          <h2>Training Partner-wise (unique candidates)</h2>
+          <div id="partnerBreakdown"></div>
+        </div>
+        <div class="panel">
+          <h2>Job Role-wise (unique candidates)</h2>
+          <div id="jobRoleBreakdown"></div>
+        </div>
+      </div>
+
+      <div class="table-section">
+        <div class="table-header">
+          <h2>Today's Submissions</h2>
+          <div class="download-buttons">
+            <button class="btn-secondary" id="downloadTodayBtn">⬇ Today (Excel)</button>
+            <button class="btn-secondary" id="downloadAllBtn">⬇ All Data (Excel)</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Aadhar</th>
+                <th>Name</th>
+                <th>Mobile</th>
+                <th>Job Role</th>
+                <th>Training Partner</th>
+                <th>District</th>
+                <th>Taluka</th>
+                <th>Gram Panchayat</th>
+              </tr>
+            </thead>
+            <tbody id="todayTableBody"></tbody>
+          </table>
+          <div class="empty-state" id="todayEmptyState" style="display:none;">No submissions recorded yet today.</div>
+        </div>
+        <div class="pagination" id="pagination" style="display:none;">
+          <div class="pagination-info" id="paginationInfo"></div>
+          <div class="pagination-controls">
+            <label for="pageSize" style="font-size:13px;color:var(--muted);margin-right:6px;">Rows per page</label>
+            <select id="pageSize">
+              <option value="10">10</option>
+              <option value="25" selected>25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+            <button class="btn-secondary" id="prevPageBtn">‹ Prev</button>
+            <span id="pageIndicator" style="font-size:13px;color:var(--muted);"></span>
+            <button class="btn-secondary" id="nextPageBtn">Next ›</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    ...opts,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Request failed (${res.status})`);
+  }
+  return res.json();
+}
+
+function escapeHtml(str) {
+  return String(str ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+function renderBreakdown(containerId, items, maxItems = 8) {
+  const container = $(containerId);
+  if (!items || !items.length) {
+    container.innerHTML = '<div class="empty-state">No data yet.</div>';
+    return;
+  }
+  const max = Math.max(...items.map((i) => i.count));
+  container.innerHTML = items.slice(0, maxItems).map((item) => `
+    <div class="bar-row">
+      <div class="name" title="${escapeHtml(item.label)}">${escapeHtml(item.label)}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${(item.count / max) * 100}%"></div></div>
+      <div class="bar-count">${item.count}</div>
+    </div>
+  `).join('');
+}
+
+// ---- Pagination state (client-side, over today's already-fetched rows) ----
+let allTodayRows = [];
+let currentPage = 1;
+let pageSize = 25;
+
+function renderTablePage() {
+  const tbody = $('#todayTableBody');
+  const total = allTodayRows.length;
+
+  if (!total) {
+    tbody.innerHTML = '';
+    $('#todayEmptyState').style.display = 'block';
+    $('#pagination').style.display = 'none';
+    return;
+  }
+
+  $('#todayEmptyState').style.display = 'none';
+  $('#pagination').style.display = 'flex';
+
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  if (currentPage > totalPages) currentPage = totalPages;
+  if (currentPage < 1) currentPage = 1;
+
+  const startIdx = (currentPage - 1) * pageSize;
+  const endIdx = Math.min(startIdx + pageSize, total);
+  const pageRows = allTodayRows.slice(startIdx, endIdx);
+
+  tbody.innerHTML = pageRows.map((r) => `
+    <tr>
+      <td>${escapeHtml(r.aadhar)}</td>
+      <td>${escapeHtml(r.name)}</td>
+      <td>${escapeHtml(r.mobile)}</td>
+      <td>${escapeHtml(r.jobRole)}</td>
+      <td>${escapeHtml(r.trainingPartner)}</td>
+      <td>${escapeHtml(r.district)}</td>
+      <td>${escapeHtml(r.taluka)}</td>
+      <td>${escapeHtml(r.gramPanchayat)}</td>
+    </tr>
+  `).join('');
+
+  $('#paginationInfo').textContent = `Showing ${startIdx + 1}–${endIdx} of ${total}`;
+  $('#pageIndicator').textContent = `Page ${currentPage} of ${totalPages}`;
+  $('#prevPageBtn').disabled = currentPage <= 1;
+  $('#nextPageBtn').disabled = currentPage >= totalPages;
+}
+
+$('#pageSize').addEventListener('change', (e) => {
+  pageSize = parseInt(e.target.value, 10);
+  currentPage = 1;
+  renderTablePage();
+});
+$('#prevPageBtn').addEventListener('click', () => {
+  currentPage -= 1;
+  renderTablePage();
+});
+$('#nextPageBtn').addEventListener('click', () => {
+  currentPage += 1;
+  renderTablePage();
+});
+
+async function loadDashboard() {
+  $('#loadingDash').style.display = 'block';
+  $('#dashContent').style.display = 'none';
+  try {
+    const [stats, todayRows] = await Promise.all([api('/api/stats'), api('/api/today')]);
+
+    $('#statTotalUnique').textContent = stats.totalUniqueCandidates;
+    $('#statTotalRows').textContent = `${stats.totalRows} total submissions`;
+    $('#statTodayUnique').textContent = stats.todayUniqueCandidates;
+    $('#statTodayRows').textContent = `${stats.todayRows} submissions today`;
+    $('#statPartnerCount').textContent = stats.byTrainingPartner.length;
+    $('#statJobRoleCount').textContent = stats.byJobRole.length;
+
+    renderBreakdown('#partnerBreakdown', stats.byTrainingPartner);
+    renderBreakdown('#jobRoleBreakdown', stats.byJobRole);
+
+    allTodayRows = todayRows;
+    currentPage = 1;
+    pageSize = parseInt($('#pageSize').value, 10);
+    renderTablePage();
+
+    $('#loadingDash').style.display = 'none';
+    $('#dashContent').style.display = 'block';
+  } catch (err) {
+    $('#loadingDash').textContent = `Failed to load data: ${err.message}`;
+  }
+}
+
+function showDashboard(username) {
+  $('#loginScreen').style.display = 'none';
+  $('#dashboard').style.display = 'block';
+  $('#whoami').textContent = username ? `Signed in as ${username}` : '';
+  loadDashboard();
+}
+
+function showLogin() {
+  $('#dashboard').style.display = 'none';
+  $('#loginScreen').style.display = 'flex';
+}
+
+// ---- Login form ----
+$('#loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const username = $('#username').value.trim();
+  const password = $('#password').value;
+  const btn = $('#loginBtn');
+  const errorBox = $('#loginError');
+  errorBox.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
+  try {
+    await api('/api/login', { method: 'POST', body: JSON.stringify({ username, password }) });
+    showDashboard(username);
+  } catch (err) {
+    errorBox.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sign In';
+  }
+});
+
+$('#logoutBtn').addEventListener('click', async () => {
+  await api('/api/logout', { method: 'POST' });
+  showLogin();
+});
+
+$('#downloadTodayBtn').addEventListener('click', () => {
+  window.location.href = '/download/today';
+});
+$('#downloadAllBtn').addEventListener('click', () => {
+  window.location.href = '/download/all';
+});
+
+// ---- On load, check if a session already exists ----
+(async function init() {
+  try {
+    const { loggedIn } = await api('/api/session');
+    if (loggedIn) showDashboard();
+    else showLogin();
+  } catch {
+    showLogin();
+  }
+})();
+</script>
+</body>
+</html>
