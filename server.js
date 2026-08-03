@@ -15,8 +15,6 @@ const { MongoClient } = require('mongodb');
 const REQUIRED_ENV = ['MONGO_URI', 'DB_NAME', 'COLLECTION_NAME', 'ADMIN_USERNAME', 'ADMIN_PASSWORD_HASH', 'SESSION_SECRET'];
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
 if (missing.length) {
-  // Throwing (rather than process.exit) so this surfaces clearly in both
-  // `node server.js` locally AND in Vercel's serverless function logs.
   throw new Error(
     `Missing required environment variables: ${missing.join(', ')}. ` +
     'Copy .env.example to .env locally, or set these in your Vercel project settings.'
@@ -26,16 +24,13 @@ if (missing.length) {
 const PORT = process.env.PORT || 3000;
 const TIMEZONE = process.env.TIMEZONE || 'Asia/Kolkata';
 
-// The exact fields the dashboard/table/exports are allowed to show.
-// This is the ONLY place field names are mapped, so it's easy to adjust
-// if a client's Mongo documents use slightly different field names.
 const FIELD_MAP = {
   aadhar: 'aadhar',
   name: 'name',
   mobile: 'mobile',
   jobRole: 'jobRole',
   trainingPartner: 'trainingPartner',
-  district: 'district', // falls back to '' if not present on the document
+  district: 'district',
   taluka: 'taluka',
   gramPanchayat: 'gramPanchayat',
 };
@@ -64,7 +59,6 @@ function shapeDoc(doc) {
   return out;
 }
 
-// ---- Timezone-safe "today" boundaries (no extra date library needed) ----
 function getTodayRangeUTC(timeZone) {
   const now = new Date();
   const dtf = new Intl.DateTimeFormat('en-US', {
@@ -78,22 +72,17 @@ function getTodayRangeUTC(timeZone) {
     return acc;
   }, {});
   const asIfUTC = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
-  const offsetMinutes = Math.round((asIfUTC - now.getTime()) / 60000); // timezone minus UTC
+  const offsetMinutes = Math.round((asIfUTC - now.getTime()) / 60000);
   const localMidnightAsIfUTC = Date.UTC(parts.year, parts.month - 1, parts.day, 0, 0, 0);
   const startUTC = new Date(localMidnightAsIfUTC - offsetMinutes * 60000);
   const endUTC = new Date(startUTC.getTime() + 24 * 60 * 60 * 1000);
   return { start: startUTC, end: endUTC };
 }
 
-// ---- App setup ----
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(express.json());
-// Serves public/index.html etc. for local dev (`npm start` -> localhost:3000).
-// On Vercel this middleware is simply never reached for those paths — Vercel
-// serves anything in public/** directly via its CDN before requests hit this
-// function at all, so nothing needs to change here for deployment.
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.use(session({
@@ -103,15 +92,15 @@ app.use(session({
     mongoUrl: process.env.MONGO_URI,
     dbName: process.env.DB_NAME,
     collectionName: 'sessions',
-    ttl: 8 * 60 * 60, // seconds
+    ttl: 8 * 60 * 60,
   }),
   resave: false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production', // Vercel sets NODE_ENV=production automatically
-    maxAge: 8 * 60 * 60 * 1000, // 8 hours
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 8 * 60 * 60 * 1000,
   },
 }));
 
@@ -128,10 +117,6 @@ function requireLogin(req, res, next) {
   return res.status(401).json({ error: 'Not logged in' });
 }
 
-// ---- Mongo connection ----
-// Cached across invocations: on Vercel, warm serverless instances reuse this
-// module's memory, so we connect once and reuse the same client rather than
-// reconnecting on every request (works the same way for local `npm start`).
 let clientPromise = null;
 function getCollection() {
   if (!clientPromise) {
@@ -144,8 +129,6 @@ function getCollection() {
   return clientPromise.then((client) => client.db(process.env.DB_NAME).collection(process.env.COLLECTION_NAME));
 }
 
-// Makes req.collection available to every route below without each one
-// needing to know about connection caching.
 app.use(async (req, res, next) => {
   try {
     req.collection = await getCollection();
@@ -153,7 +136,6 @@ app.use(async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ---- Auth routes ----
 app.get('/api/session', (req, res) => {
   res.json({ loggedIn: !!(req.session && req.session.loggedIn) });
 });
@@ -177,7 +159,6 @@ app.post('/api/logout', (req, res) => {
   req.session.destroy(() => res.json({ ok: true }));
 });
 
-// ---- Data routes ----
 app.get('/api/today', requireLogin, async (req, res, next) => {
   try {
     const { start, end } = getTodayRangeUTC(TIMEZONE);
@@ -189,43 +170,64 @@ app.get('/api/today', requireLogin, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+const statsProjection = {
+  _id: 0,
+  [FIELD_MAP.aadhar]: 1,
+  [FIELD_MAP.trainingPartner]: 1,
+  [FIELD_MAP.jobRole]: 1,
+  submittedAt: 1,
+};
+
 app.get('/api/stats', requireLogin, async (req, res, next) => {
   try {
     const { start, end } = getTodayRangeUTC(TIMEZONE);
 
-    const [totalUniqueAgg, todayUniqueAgg, byPartnerAgg, byJobRoleAgg, totalRows, todayRows] = await Promise.all([
-      req.collection.aggregate([{ $group: { _id: `$${FIELD_MAP.aadhar}` } }, { $count: 'count' }], { allowDiskUse: true }).toArray(),
-      req.collection.aggregate([
-        { $match: { submittedAt: { $gte: start, $lt: end } } },
-        { $group: { _id: `$${FIELD_MAP.aadhar}` } },
-        { $count: 'count' },
-      ], { allowDiskUse: true }).toArray(),
-      req.collection.aggregate([
-        { $group: { _id: { partner: `$${FIELD_MAP.trainingPartner}`, aadhar: `$${FIELD_MAP.aadhar}` } } },
-        { $group: { _id: '$_id.partner', count: { $sum: 1 } } },
-        { $sort: { count: -1 } },
-      ], { allowDiskUse: true }).toArray(),
-      req.collection.aggregate([
-        { $group: { _id: { jobRole: `$${FIELD_MAP.jobRole}`, aadhar: `$${FIELD_MAP.aadhar}` } } },
-        { $group: { _id: '$_id.jobRole', count: { $sum: 1 } } },
-        { $sort: { count: -1 } },
-      ], { allowDiskUse: true }).toArray(),
-      req.collection.countDocuments({}),
-      req.collection.countDocuments({ submittedAt: { $gte: start, $lt: end } }),
-    ]);
+    // Computed in application code rather than a Mongo aggregation pipeline
+    // — Atlas Free/Shared tiers don't support allowDiskUse, so large
+    // in-database group/sort ops can hit a hard memory wall regardless.
+    const docs = await req.collection.find({}, { projection: statsProjection }).toArray();
+
+    const totalUniqueSet = new Set();
+    const todayUniqueSet = new Set();
+    const partnerMap = new Map();
+    const jobRoleMap = new Map();
+    let todayRows = 0;
+
+    for (const d of docs) {
+      const aadhar = d[FIELD_MAP.aadhar];
+      const partner = d[FIELD_MAP.trainingPartner] || 'Unknown';
+      const jobRole = d[FIELD_MAP.jobRole] || 'Unknown';
+      const isToday = d.submittedAt && new Date(d.submittedAt) >= start && new Date(d.submittedAt) < end;
+
+      totalUniqueSet.add(aadhar);
+      if (isToday) {
+        todayUniqueSet.add(aadhar);
+        todayRows += 1;
+      }
+
+      if (!partnerMap.has(partner)) partnerMap.set(partner, new Set());
+      partnerMap.get(partner).add(aadhar);
+
+      if (!jobRoleMap.has(jobRole)) jobRoleMap.set(jobRole, new Set());
+      jobRoleMap.get(jobRole).add(aadhar);
+    }
+
+    const toSortedCounts = (map) =>
+      [...map.entries()]
+        .map(([label, set]) => ({ label, count: set.size }))
+        .sort((a, b) => b.count - a.count);
 
     res.json({
-      totalUniqueCandidates: totalUniqueAgg[0]?.count || 0,
-      todayUniqueCandidates: todayUniqueAgg[0]?.count || 0,
-      totalRows,
+      totalUniqueCandidates: totalUniqueSet.size,
+      todayUniqueCandidates: todayUniqueSet.size,
+      totalRows: docs.length,
       todayRows,
-      byTrainingPartner: byPartnerAgg.map((r) => ({ label: r._id || 'Unknown', count: r.count })),
-      byJobRole: byJobRoleAgg.map((r) => ({ label: r._id || 'Unknown', count: r.count })),
+      byTrainingPartner: toSortedCounts(partnerMap),
+      byJobRole: toSortedCounts(jobRoleMap),
     });
   } catch (err) { next(err); }
 });
 
-// ---- Excel export ----
 async function buildWorkbook(docs, sheetTitle) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet(sheetTitle);
@@ -252,14 +254,21 @@ app.get('/download/today', requireLogin, async (req, res, next) => {
 
 app.get('/download/all', requireLogin, async (req, res, next) => {
   try {
-    // Dedupe by Aadhar: keep only the most recent submission per candidate.
-    const docs = await req.collection.aggregate([
-      { $sort: { submittedAt: -1 } },
-      { $group: { _id: `$${FIELD_MAP.aadhar}`, doc: { $first: '$$ROOT' } } },
-      { $replaceRoot: { newRoot: '$doc' } },
-      { $project: projection },
-    ], { allowDiskUse: true }).toArray();
-    const workbook = await buildWorkbook(docs, 'All Candidates (Unique Aadhar)');
+    // Dedupe by Aadhar, keeping each candidate's most recent submission —
+    // done here in JS rather than a Mongo $sort+$group for the same
+    // Atlas Free/Shared tier memory-limit reason as above.
+    const docs = await req.collection.find({}, { projection }).toArray();
+    docs.sort((a, b) => new Date(b.submittedAt) - new Date(a.submittedAt));
+    const seen = new Set();
+    const deduped = [];
+    for (const d of docs) {
+      const key = d[FIELD_MAP.aadhar];
+      if (!seen.has(key)) {
+        seen.add(key);
+        deduped.push(d);
+      }
+    }
+    const workbook = await buildWorkbook(deduped, 'All Candidates (Unique Aadhar)');
     const dateStr = new Date().toISOString().slice(0, 10);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="candidates-all-${dateStr}.xlsx"`);
@@ -273,9 +282,6 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Server error' });
 });
 
-// Vercel imports this file and calls the exported app directly as a
-// serverless function — it does NOT run app.listen(). Locally, running
-// `node server.js` / `npm start` still starts a normal server on PORT.
 module.exports = app;
 
 if (require.main === module) {
