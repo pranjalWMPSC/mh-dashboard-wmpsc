@@ -2,6 +2,8 @@ require('dotenv').config();
 
 const express = require('express');
 const session = require('express-session');
+// connect-mongo's CJS/ESM interop varies by version — some resolve to the
+// class directly, others wrap it under `.default`. Handle both.
 const connectMongo = require('connect-mongo');
 const MongoStore = connectMongo.default || connectMongo;
 const rateLimit = require('express-rate-limit');
@@ -192,22 +194,22 @@ app.get('/api/stats', requireLogin, async (req, res, next) => {
     const { start, end } = getTodayRangeUTC(TIMEZONE);
 
     const [totalUniqueAgg, todayUniqueAgg, byPartnerAgg, byJobRoleAgg, totalRows, todayRows] = await Promise.all([
-      req.collection.aggregate([{ $group: { _id: `$${FIELD_MAP.aadhar}` } }, { $count: 'count' }]).toArray(),
+      req.collection.aggregate([{ $group: { _id: `$${FIELD_MAP.aadhar}` } }, { $count: 'count' }], { allowDiskUse: true }).toArray(),
       req.collection.aggregate([
         { $match: { submittedAt: { $gte: start, $lt: end } } },
         { $group: { _id: `$${FIELD_MAP.aadhar}` } },
         { $count: 'count' },
-      ]).toArray(),
+      ], { allowDiskUse: true }).toArray(),
       req.collection.aggregate([
         { $group: { _id: { partner: `$${FIELD_MAP.trainingPartner}`, aadhar: `$${FIELD_MAP.aadhar}` } } },
         { $group: { _id: '$_id.partner', count: { $sum: 1 } } },
         { $sort: { count: -1 } },
-      ]).toArray(),
+      ], { allowDiskUse: true }).toArray(),
       req.collection.aggregate([
         { $group: { _id: { jobRole: `$${FIELD_MAP.jobRole}`, aadhar: `$${FIELD_MAP.aadhar}` } } },
         { $group: { _id: '$_id.jobRole', count: { $sum: 1 } } },
         { $sort: { count: -1 } },
-      ]).toArray(),
+      ], { allowDiskUse: true }).toArray(),
       req.collection.countDocuments({}),
       req.collection.countDocuments({ submittedAt: { $gte: start, $lt: end } }),
     ]);
@@ -256,7 +258,7 @@ app.get('/download/all', requireLogin, async (req, res, next) => {
       { $group: { _id: `$${FIELD_MAP.aadhar}`, doc: { $first: '$$ROOT' } } },
       { $replaceRoot: { newRoot: '$doc' } },
       { $project: projection },
-    ]).toArray();
+    ], { allowDiskUse: true }).toArray();
     const workbook = await buildWorkbook(docs, 'All Candidates (Unique Aadhar)');
     const dateStr = new Date().toISOString().slice(0, 10);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
