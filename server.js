@@ -35,7 +35,7 @@ const FIELD_MAP = {
   mobile: 'mobile',
   jobRole: 'jobRole',
   trainingPartner: 'trainingPartner',
-  district: 'district', // falls back to '' if not present on the document
+  district: 'centerName', // falls back to '' if not present on the document
   taluka: 'taluka',
   gramPanchayat: 'gramPanchayat',
 };
