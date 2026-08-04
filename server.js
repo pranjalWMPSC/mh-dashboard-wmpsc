@@ -15,6 +15,8 @@ const { MongoClient } = require('mongodb');
 const REQUIRED_ENV = ['MONGO_URI', 'DB_NAME', 'COLLECTION_NAME', 'ADMIN_USERNAME', 'ADMIN_PASSWORD_HASH', 'SESSION_SECRET'];
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
 if (missing.length) {
+  // Throwing (rather than process.exit) so this surfaces clearly in both
+  // `node server.js` locally AND in Vercel's serverless function logs.
   throw new Error(
     `Missing required environment variables: ${missing.join(', ')}. ` +
     'Copy .env.example to .env locally, or set these in your Vercel project settings.'
@@ -24,13 +26,16 @@ if (missing.length) {
 const PORT = process.env.PORT || 3000;
 const TIMEZONE = process.env.TIMEZONE || 'Asia/Kolkata';
 
+// The exact fields the dashboard/table/exports are allowed to show.
+// This is the ONLY place field names are mapped, so it's easy to adjust
+// if a client's Mongo documents use slightly different field names.
 const FIELD_MAP = {
   aadhar: 'aadhar',
   name: 'name',
   mobile: 'mobile',
   jobRole: 'jobRole',
   trainingPartner: 'trainingPartner',
-  district: 'district',
+  district: 'district', // falls back to '' if not present on the document
   taluka: 'taluka',
   gramPanchayat: 'gramPanchayat',
 };
@@ -59,6 +64,7 @@ function shapeDoc(doc) {
   return out;
 }
 
+// ---- Timezone-safe "today" boundaries (no extra date library needed) ----
 function getTodayRangeUTC(timeZone) {
   const now = new Date();
   const dtf = new Intl.DateTimeFormat('en-US', {
@@ -72,18 +78,53 @@ function getTodayRangeUTC(timeZone) {
     return acc;
   }, {});
   const asIfUTC = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
-  const offsetMinutes = Math.round((asIfUTC - now.getTime()) / 60000);
+  const offsetMinutes = Math.round((asIfUTC - now.getTime()) / 60000); // timezone minus UTC
   const localMidnightAsIfUTC = Date.UTC(parts.year, parts.month - 1, parts.day, 0, 0, 0);
   const startUTC = new Date(localMidnightAsIfUTC - offsetMinutes * 60000);
   const endUTC = new Date(startUTC.getTime() + 24 * 60 * 60 * 1000);
   return { start: startUTC, end: endUTC };
 }
 
+// ---- App setup ----
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(express.json());
+// Serves public/index.html etc. for local dev (`npm start` -> localhost:3000).
+// On Vercel this middleware is simply never reached for those paths — Vercel
+// serves anything in public/** directly via its CDN before requests hit this
+// function at all, so nothing needs to change here for deployment.
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ---- Same-origin enforcement ----
+// Blocks any request that didn't originate from this app's own pages —
+// direct API calls via curl/Postman/another website get rejected, even if
+// someone somehow obtained a valid session cookie. Modern browsers attach
+// Sec-Fetch-Site automatically and reliably on every request; that's the
+// primary signal. Origin/Referer are checked as a fallback for the rare
+// client that doesn't send Sec-Fetch-Site.
+function sameOriginOnly(req, res, next) {
+  const secFetchSite = req.get('sec-fetch-site');
+  if (secFetchSite) {
+    // 'same-origin': fetch from our own page. 'none': user directly typed/
+    // bookmarked/clicked into a URL (e.g. the "Today (Excel)" download
+    // link acts like this in some browsers). Both are legitimate.
+    if (secFetchSite === 'same-origin' || secFetchSite === 'none') return next();
+    return res.status(403).json({ error: 'Cross-origin requests are not allowed' });
+  }
+
+  const hostMatches = (headerValue) => {
+    try { return new URL(headerValue).host === req.get('host'); } catch { return false; }
+  };
+  const origin = req.get('origin');
+  const referer = req.get('referer');
+  if (origin) return hostMatches(origin) ? next() : res.status(403).json({ error: 'Cross-origin requests are not allowed' });
+  if (referer) return hostMatches(referer) ? next() : res.status(403).json({ error: 'Cross-origin requests are not allowed' });
+
+  // No same-origin signal at all (e.g. a bare curl request) — reject.
+  return res.status(403).json({ error: 'Cross-origin requests are not allowed' });
+}
+app.use(sameOriginOnly);
 
 app.use(session({
   name: 'wmpsc.sid',
@@ -92,15 +133,15 @@ app.use(session({
     mongoUrl: process.env.MONGO_URI,
     dbName: process.env.DB_NAME,
     collectionName: 'sessions',
-    ttl: 8 * 60 * 60,
+    ttl: 8 * 60 * 60, // seconds
   }),
   resave: false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
-    maxAge: 8 * 60 * 60 * 1000,
+    secure: process.env.NODE_ENV === 'production', // Vercel sets NODE_ENV=production automatically
+    maxAge: 8 * 60 * 60 * 1000, // 8 hours
   },
 }));
 
@@ -117,6 +158,10 @@ function requireLogin(req, res, next) {
   return res.status(401).json({ error: 'Not logged in' });
 }
 
+// ---- Mongo connection ----
+// Cached across invocations: on Vercel, warm serverless instances reuse this
+// module's memory, so we connect once and reuse the same client rather than
+// reconnecting on every request (works the same way for local `npm start`).
 let clientPromise = null;
 function getCollection() {
   if (!clientPromise) {
@@ -129,6 +174,8 @@ function getCollection() {
   return clientPromise.then((client) => client.db(process.env.DB_NAME).collection(process.env.COLLECTION_NAME));
 }
 
+// Makes req.collection available to every route below without each one
+// needing to know about connection caching.
 app.use(async (req, res, next) => {
   try {
     req.collection = await getCollection();
@@ -136,6 +183,7 @@ app.use(async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ---- Auth routes ----
 app.get('/api/session', (req, res) => {
   res.json({ loggedIn: !!(req.session && req.session.loggedIn) });
 });
@@ -159,6 +207,7 @@ app.post('/api/logout', (req, res) => {
   req.session.destroy(() => res.json({ ok: true }));
 });
 
+// ---- Data routes ----
 app.get('/api/today', requireLogin, async (req, res, next) => {
   try {
     const { start, end } = getTodayRangeUTC(TIMEZONE);
@@ -166,7 +215,18 @@ app.get('/api/today', requireLogin, async (req, res, next) => {
       .find({ submittedAt: { $gte: start, $lt: end } }, { projection })
       .sort({ submittedAt: -1 })
       .toArray();
-    res.json(docs.map(shapeDoc));
+    // Dedupe by Aadhar (keep the most recent of the day per candidate) so
+    // the on-page table/pagination never shows the same person twice.
+    const seen = new Set();
+    const deduped = [];
+    for (const d of docs) {
+      const key = d[FIELD_MAP.aadhar];
+      if (!seen.has(key)) {
+        seen.add(key);
+        deduped.push(d);
+      }
+    }
+    res.json(deduped.map(shapeDoc));
   } catch (err) { next(err); }
 });
 
@@ -183,14 +243,15 @@ app.get('/api/stats', requireLogin, async (req, res, next) => {
     const { start, end } = getTodayRangeUTC(TIMEZONE);
 
     // Computed in application code rather than a Mongo aggregation pipeline
-    // — Atlas Free/Shared tiers don't support allowDiskUse, so large
-    // in-database group/sort ops can hit a hard memory wall regardless.
+    // — see the comment on /download/all for why (Atlas Free/Shared tiers
+    // don't support allowDiskUse, so large in-database group/sort ops can
+    // hit a hard memory wall regardless of that option).
     const docs = await req.collection.find({}, { projection: statsProjection }).toArray();
 
     const totalUniqueSet = new Set();
     const todayUniqueSet = new Set();
-    const partnerMap = new Map();
-    const jobRoleMap = new Map();
+    const partnerMap = new Map(); // partner -> Set(aadhar)
+    const jobRoleMap = new Map(); // jobRole -> Set(aadhar)
     let todayRows = 0;
 
     for (const d of docs) {
@@ -228,6 +289,7 @@ app.get('/api/stats', requireLogin, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ---- Excel export ----
 async function buildWorkbook(docs, sheetTitle) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet(sheetTitle);
@@ -254,9 +316,11 @@ app.get('/download/today', requireLogin, async (req, res, next) => {
 
 app.get('/download/all', requireLogin, async (req, res, next) => {
   try {
-    // Dedupe by Aadhar, keeping each candidate's most recent submission —
-    // done here in JS rather than a Mongo $sort+$group for the same
-    // Atlas Free/Shared tier memory-limit reason as above.
+    // Dedupe by Aadhar, keeping each candidate's most recent submission.
+    // Done in application code (not a Mongo $sort+$group aggregation)
+    // because MongoDB Atlas's Free/Shared tiers (M0/M2/M5) don't support
+    // allowDiskUse, so a large in-database sort/group can hit Atlas's
+    // hard memory limit regardless of that option.
     const docs = await req.collection.find({}, { projection }).toArray();
     docs.sort((a, b) => new Date(b.submittedAt) - new Date(a.submittedAt));
     const seen = new Set();
@@ -282,6 +346,9 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Server error' });
 });
 
+// Vercel imports this file and calls the exported app directly as a
+// serverless function — it does NOT run app.listen(). Locally, running
+// `node server.js` / `npm start` still starts a normal server on PORT.
 module.exports = app;
 
 if (require.main === module) {
